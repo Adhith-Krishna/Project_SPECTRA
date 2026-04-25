@@ -76,7 +76,8 @@ def _load_raw(h5_path: str) -> np.array:
     if raw.ndim != 2:
         raise ValueError(f"Expected 2D (C, T), got {raw.shape}")
     
-    data = raw.T if raw.shape[0] < raw.shape [1] else raw
+    data = raw.T if raw.shape[0] < raw.shape[1] else raw
+    print(f"[loader] After transpose: {data.shape} — expecting (61440, 1677)")
     data = data.astype(np.float32)
 
     T,C = data.shape
@@ -248,7 +249,8 @@ def build_dataloaders(
 ) -> Tuple ["JAXDataLoader", "JAXDataLoader", Tuple[jax.Array, jax.Array]]:
     
     data    = _load_raw(h5_path)
-    split   = int(len(data) * (1 - val_fraction))
+    split = int(len(data) * (1 - val_fraction))
+    print(f"[loader] Split index: {split} — expecting ~52274")
 
     mean, scale = _fit_scaler(data[:split], scaler_save_path)
 
