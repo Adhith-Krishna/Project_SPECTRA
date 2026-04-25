@@ -143,14 +143,14 @@ def _extract_batch(
 # ----------------------------------------------------------------------
 #  V. Iterator
 # ----------------------------------------------------------------------
-def _prefetch(iterator: Iterator[Batch], buffer_size: int=2) -> Iterator[Batch]:
+def _prefetch(iterator, buffer_size: int = 2):
     from collections import deque
-    queue: deque = deque()
+    queue = deque()
 
-    def enqueue(n: int):
+    def enqueue(n):
         for _ in range(n):
             try:
-                queue.append(next(Iterator))
+                queue.append(next(iterator))
             except StopIteration:
                 pass
 
@@ -166,32 +166,32 @@ def _prefetch(iterator: Iterator[Batch], buffer_size: int=2) -> Iterator[Batch]:
 class JAXDataLoader:
     def __init__(
         self,
-        data:       jax.Array,
-        mean:       jax.Array,
-        scale:      jax.Array,
-        window_size:int = 1024,
-        stride:     int = 128,
-        batch_size: int = 64,
-        shuffle:    bool = False,
-        drop_last:  bool = True,
-        seed:       int = 42,
-        prefetch:   int = 2,
+        data:        jax.Array,
+        mean:        jax.Array,
+        scale:       jax.Array,
+        window_size: int  = 1024,
+        stride:      int  = 128,
+        batch_size:  int  = 64,
+        shuffle:     bool = False,
+        drop_last:   bool = True,
+        seed:        int  = 42,
+        prefetch:    int  = 2,
     ):
-        self.data           = data
-        self.mean           = mean
-        self.scale          = scale 
-        self.window_size    = window_size
-        self.batch_size     = batch_size
-        self.shuffle        = shuffle
-        self.drop_last      = drop_last
-        self.prefetch_n     = prefetch 
-        self._rng_key       = random.PRNGKey(seed)
+        self.data        = data
+        self.mean        = mean
+        self.scale       = scale
+        self.window_size = window_size
+        self.batch_size  = batch_size
+        self.shuffle     = shuffle
+        self.drop_last   = drop_last
+        self.prefetch_n  = prefetch
+        self._rng_key    = random.PRNGKey(seed)
 
         T = data.shape[0]
-        starts = jnp.arange(0, T - window_size + 1, stride, dtype = jnp.int32)
-        self._starts    = starts
-        self._n_wins    = len(starts)
-        self._labels    = jnp.zeros(batch_size, dtype=jnp.int32)
+        starts = jnp.arange(0, T - window_size + 1, stride, dtype=jnp.int32)
+        self._starts = starts
+        self._n_wins = len(starts)
+        self._labels = jnp.zeros(batch_size, dtype=jnp.int32)
 
     def __len__(self) -> int:
         if self.drop_last:
@@ -238,43 +238,43 @@ def shard_batch(batch: Batch) -> Batch:
 #  VIII. Public API
 # ----------------------------------------------------------------------
 def build_dataloaders(
-        h5_path:        str,
-        window_size:    int = 1024,
-        stride:         int = 128,
-        val_fraction:   float = 0.15,
-        batch_size:     int = 64,
-        scaler_save_path: str = "scaler_clean.pkl",
-        seed:           int = 42,
-        prefetch:       int = 2,
-) -> Tuple ["JAXDataLoader", "JAXDataLoader", Tuple[jax.Array, jax.Array]]:
-    
-    data    = _load_raw(h5_path)
+    h5_path:          str,
+    window_size:      int   = 1024,
+    stride:           int   = 128,
+    val_fraction:     float = 0.15,
+    batch_size:       int   = 64,
+    scaler_save_path: str   = "scaler_clean.pkl",
+    seed:             int   = 42,
+    prefetch:         int   = 2,
+) -> Tuple["JAXDataLoader", "JAXDataLoader", Tuple[jax.Array, jax.Array]]:
+
+    data  = _load_raw(h5_path)
     split = int(len(data) * (1 - val_fraction))
     print(f"[loader] Split index: {split} — expecting ~52274")
 
     mean, scale = _fit_scaler(data[:split], scaler_save_path)
 
-    train_dev   = _to_device(data[:split])
-    val_dev     = _to_device(data[split:])
+    train_dev = _to_device(data[:split])
+    val_dev   = _to_device(data[split:])
 
     T_train = train_dev.shape[0]
     T_val   = val_dev.shape[0]
     n_train = (T_train - window_size) // stride + 1
-    n_val   = (T_val - window_size) // stride + 1
-    print (f"[loader] Train: {n_train:,} windows |  Val: {n_val:,} windows"
-           f"(window={window_size}, stride={stride})")
-    
+    n_val   = (T_val   - window_size) // stride + 1
+    print(f"[loader] Train: {n_train:,} windows | Val: {n_val:,} windows "
+          f"(window={window_size}, stride={stride})")
+
     train_loader = JAXDataLoader(
         train_dev, mean, scale,
-        window_size = window_size, stride = stride,
-        batch_size = batch_size, shuffle = True,
-        drop_last=True, seed = seed, prefetch = prefetch,
+        window_size=window_size, stride=stride,
+        batch_size=batch_size, shuffle=True,
+        drop_last=True, seed=seed, prefetch=prefetch,
     )
     val_loader = JAXDataLoader(
         val_dev, mean, scale,
-        window_size = window_size, stride = stride,
-        batch_size = batch_size, shuffle = False,
-        drop_last=False, seed = seed, prefetch = prefetch,        
+        window_size=window_size, stride=stride,
+        batch_size=batch_size, shuffle=False,
+        drop_last=False, seed=seed, prefetch=prefetch,
     )
     return train_loader, val_loader, (mean, scale)
 
