@@ -270,7 +270,7 @@ def build_dataloaders(
         batch_size = batch_size, shuffle = True,
         drop_last=True, seed = seed, prefetch = prefetch,
     )
-    val_loader = JAXDataLoader (
+    val_loader = JAXDataLoader(
         window_size = window_size, stride = stride,
         batch_size = batch_size, shuffle = False,
         drop_last=False, seed = seed, prefetch = prefetch,        
