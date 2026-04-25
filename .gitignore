@@ -1,0 +1,11 @@
+spectra_env/
+__pycache__/
+*.pkl
+*.h5
+*.pyc
+.DS_Store
+*.egg-info/
+dist/
+.ipynb_checkpoints/
+data/
+
