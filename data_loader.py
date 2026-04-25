@@ -271,6 +271,7 @@ def build_dataloaders(
         drop_last=True, seed = seed, prefetch = prefetch,
     )
     val_loader = JAXDataLoader(
+        val_dev, mean, scale,
         window_size = window_size, stride = stride,
         batch_size = batch_size, shuffle = False,
         drop_last=False, seed = seed, prefetch = prefetch,        
