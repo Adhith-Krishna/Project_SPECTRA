@@ -151,43 +151,62 @@ def extract_window_features(window: np.ndarray) -> np.ndarray:
     """
     Extract 8 features from one window of WINDOW_LEN samples.
     Returns np.ndarray of shape (8,).
+    All operations are NaN-safe via eps guards and explicit nan_to_num.
     """
     n   = len(window)
     eps = 1e-12
 
+    # Guard: if window is all zeros or constant, return safe zeros
+    if np.all(window == window[0]):
+        return np.zeros(8, dtype=np.float32)
+
     # f1: RMS energy
     rms = np.sqrt(np.mean(window ** 2))
+    rms = max(rms, eps)
 
     # f2: Peak-to-peak amplitude
-    p2p = window.max() - window.min()
+    p2p = float(window.max() - window.min())
 
-    # f3: Kurtosis
-    kurt = kurtosis(window, fisher=True)   # excess kurtosis (0 for Gaussian)
+    # f3: Kurtosis — can be NaN for constant windows (guarded above)
+    try:
+        kurt = float(kurtosis(window, fisher=True))
+        if not np.isfinite(kurt):
+            kurt = 0.0
+    except Exception:
+        kurt = 0.0
 
     # f4: Crest factor
-    crest = np.max(np.abs(window)) / (rms + eps)
+    crest = float(np.max(np.abs(window))) / rms
 
     # f5: Zero crossing rate
-    zcr = np.sum(np.diff(np.sign(window)) != 0) / n
+    zcr = float(np.sum(np.diff(np.sign(window)) != 0)) / n
 
     # f6, f7, f8: Spectral features via FFT
     fft_mag  = np.abs(np.fft.rfft(window * np.hanning(n)))
     freqs    = np.fft.rfftfreq(n, d=1.0/FS)
     psd      = fft_mag ** 2
-    psd_norm = psd / (psd.sum() + eps)
+    psd_sum  = psd.sum()
 
-    # Spectral entropy
-    spec_ent = -np.sum(psd_norm * np.log(psd_norm + eps))
+    if psd_sum < eps:
+        # Flat spectrum — return safe defaults
+        spec_ent  = 0.0
+        dom_freq  = 0.0
+        band_ratio = 1.0
+    else:
+        psd_norm  = psd / psd_sum
+        # Spectral entropy — clip psd_norm to avoid log(0)
+        psd_norm  = np.clip(psd_norm, eps, 1.0)
+        spec_ent  = float(-np.sum(psd_norm * np.log(psd_norm)))
+        dom_freq  = float(freqs[np.argmax(psd)])
+        low_mask  = freqs <= 100.0
+        band_ratio = float(psd[low_mask].sum() / psd_sum)
 
-    # Dominant frequency (Hz)
-    dom_freq = freqs[np.argmax(psd)]
+    feats = np.array([rms, p2p, kurt, crest, zcr,
+                      spec_ent, dom_freq, band_ratio], dtype=np.float32)
 
-    # Band energy ratio: energy below 100 Hz / total
-    low_band_mask = freqs <= 100.0
-    band_ratio    = psd[low_band_mask].sum() / (psd.sum() + eps)
-
-    return np.array([rms, p2p, kurt, crest, zcr,
-                     spec_ent, dom_freq, band_ratio], dtype=np.float32)
+    # Final safety net — replace any remaining NaN/Inf with 0
+    feats = np.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
+    return feats
 
 
 def extract_sequence_features(signal: np.ndarray) -> np.ndarray:
