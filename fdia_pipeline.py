@@ -1,448 +1,374 @@
 """
 =============================================================================
-FDIA PIPELINE — Airbus Helicopter Accelerometer Dataset
+PROJECT SPECTRA — FDIA PIPELINE v2
+Signal Processing + Machine Learning Approach
 =============================================================================
 Author      : Adhith (with MIT-peer assist)
-Purpose     : Dual-use — Airbus FYI Round 2 deliverable +
-              IEEE Transactions on Aerospace and Electronic Systems paper
-Target HW   : Development on Colab/CPU; deployment target NXP MCX (later)
+Purpose     : Airbus FYI Round 2 + IEEE Transactions on AES paper
+Target HW   : Development on Colab/CPU; deployment target NXP MCX
 
-STRUCTURE
----------
-Phase 1 : Data loading & EDA
-Phase 2 : Preprocessing & windowing
-Phase 3 : Baseline anomaly detector (CAE on scalogram — best from paper)
-Phase 4 : Phase 1 evaluation — healthy vs. natural fault classification
-Phase 5 : Adversarial attack injection (FDIA threat model)
-Phase 6 : Phase 2 evaluation — can the detector catch injected attacks?
-Phase 7 : Metrics, plots, results table (paper-ready)
+ARCHITECTURE
+------------
+Phase 1 : Data loading + EDA
+Phase 2 : Signal feature extraction (no images, pure signal processing)
+Phase 3 : One-Class anomaly detector (Isolation Forest + OCSVM ensemble)
+Phase 4 : Phase 1 evaluation — healthy vs natural fault detection
+Phase 5 : FDIA adversarial attack injection (5 attack types)
+Phase 6 : Phase 2 evaluation — detection of injected attacks
+Phase 7 : Goodfellow adversarial training — harden the detector
+Phase 8 : Phase 3 evaluation — post-hardening performance
+Phase 9 : Paper-ready plots + results table
 
-PAPER NOTATION (used in comments throughout)
---------------------------------------------
-x(t)        : raw accelerometer signal, sampled at fs = 1024 Hz
-x̃(t)        : adversarially perturbed signal
-δ(t)        : adversarial perturbation = x̃(t) - x(t)
-τ           : detection threshold (99th percentile of training residuals)
-Res_k       : reconstruction residual of k-th sub-window
-ε           : attack budget (L∞ norm bound on δ)
+PAPER NOTATION
+--------------
+x(t)     : raw accelerometer signal, fs=1024 Hz
+f(x)     : feature vector extracted from x (8-dimensional)
+δ        : adversarial perturbation in signal space
+ε        : L∞ attack budget (fraction of training std)
+A(f)     : anomaly score from ensemble detector
+τ        : detection threshold (calibrated on training set)
 =============================================================================
 """
 
 # ============================================================
 # 0. DEPENDENCIES
 # ============================================================
-# Run this in Colab if needed:
-# !pip install h5py numpy scipy matplotlib scikit-learn torch torchvision tqdm
-
-import os
+import os, csv, time, warnings
 import h5py
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from scipy import signal as sp_signal
+from scipy.stats import kurtosis
+from sklearn.ensemble import IsolationForest
+from sklearn.svm import OneClassSVM
+from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (roc_auc_score, f1_score, roc_curve,
-                              confusion_matrix, ConfusionMatrixDisplay)
-from sklearn.preprocessing import label_binarize
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-from tqdm import tqdm
-import warnings
+                             confusion_matrix, ConfusionMatrixDisplay)
 warnings.filterwarnings('ignore')
 
-# Reproducibility
 SEED = 42
 np.random.seed(SEED)
-torch.manual_seed(SEED)
 
 # ============================================================
-# 1. CONFIGURATION  —  edit these paths for your setup
+# 1. CONFIGURATION
 # ============================================================
 
-# ---- SET THESE ----
-# Absolute path to the folder containing dftrain.h5, dfvalid.h5, dfvalid_groundtruth.csv
+# ---- SET THIS ----
 DATA_DIR  = os.path.expanduser(
     "~/Airbus_Fly_Your_Ideas_2026/Project_Spectra/data/airbus_heli"
 )
 TRAIN_H5  = os.path.join(DATA_DIR, "dftrain.h5")
 TEST_H5   = os.path.join(DATA_DIR, "dfvalid.h5")
-LABEL_CSV = os.path.join(DATA_DIR, "dfvalid_groundtruth.csv")  # seqID, anomaly
-# -------------------
+LABEL_CSV = os.path.join(DATA_DIR, "dfvalid_groundtruth.csv")
+# ------------------
 
-# Signal parameters (from paper + dataset spec)
-FS          = 1024          # sampling frequency, Hz
-SEQ_LEN     = 61_440        # samples per sequence = 60 s × 1024 Hz
-WINDOW_LEN  = 512           # sub-window length (0.5 s)
-N_WINDOWS   = 120           # SEQ_LEN // WINDOW_LEN
+# Signal parameters
+FS          = 1024      # Hz
+SEQ_LEN     = 61_440    # 60s × 1024 Hz
+WINDOW_LEN  = 512       # 0.5s per window
+N_WINDOWS   = SEQ_LEN // WINDOW_LEN   # = 120
 
-# Scalogram parameters (best performer in paper, AUC 92%)
-N_SCALES    = 64            # wavelet scales → image height
-IMG_SIZE    = 64            # output image: 64 × 64
+# Attack parameters
+EPSILON      = 0.10     # L∞ budget as fraction of signal std
+ATTACK_TYPES = ["gaussian_noise", "bias_injection", "scaling",
+                "replay", "fgsm_like"]
 
-# Training
-BATCH_SIZE  = 64
-EPOCHS      = 15
-LR          = 1e-3
-BOTTLENECK  = 300
-THRESHOLD_Q = 99            # percentile for τ
+# Adversarial training
+ADV_ALPHA   = 0.5       # mixture: 0.5 clean + 0.5 adversarial (Goodfellow 2015)
+ADV_EPSILON = 0.10      # perturbation budget for adversarial training
 
-# Attack parameters (Phase 5)
-ATTACK_TYPES = ["gaussian_noise", "bias_injection", "scaling", "replay", "fgsm_like"]
-EPSILON      = 0.05         # L∞ budget as fraction of signal std
-
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"[CONFIG] Device: {DEVICE}")
+print(f"[CONFIG] DATA_DIR: {DATA_DIR}")
+print(f"[CONFIG] Window: {WINDOW_LEN} samples ({WINDOW_LEN/FS*1000:.0f}ms) | "
+      f"Windows/seq: {N_WINDOWS}")
 
 
 # ============================================================
 # 2. DATA LOADING
 # ============================================================
 
-def load_train_h5(filepath: str):
-    """
-    Load training HDF5 file (Pandas format saved with df.to_hdf()).
-
-    File structure (confirmed):
-        /dftrain/block0_values  — shape (1677, 61440)  float64
-        /dftrain/axis1          — shape (1677,)         row indices
-
-    All training sequences are healthy → labels all zero.
-
-    Returns
-    -------
-    signals : np.ndarray, shape (1677, 61440)  float32
-    labels  : np.ndarray, shape (1677,)         int32, all 0
-    """
+def load_train_h5(filepath):
     fname = os.path.basename(filepath)
-    group = os.path.splitext(fname)[0]          # "dftrain"
-    key   = f"{group}/block0_values"
-
-    print(f"\n[H5] Loading training file: {fname}")
+    group = os.path.splitext(fname)[0]
     with h5py.File(filepath, 'r') as f:
-        signals = np.array(f[key], dtype=np.float32)
-
+        signals = np.array(f[f'{group}/block0_values'], dtype=np.float32)
     labels = np.zeros(len(signals), dtype=np.int32)
-    print(f"[H5] Training signals: {signals.shape}  (all healthy)")
+    print(f"[DATA] Train: {signals.shape}  (all healthy)")
     return signals, labels
 
 
-def load_valid_h5(filepath: str, label_csv: str):
-    """
-    Load validation HDF5 file and match labels from CSV.
-
-    File structure (confirmed):
-        /dfvalid/block0_values  — shape (594, 61440)  float64
-        /dfvalid/axis1          — shape (594,)         row indices 0..593
-
-    CSV structure:
-        seqID   — integer, maps to row index (0-based)
-        anomaly — 0 = healthy, 1 = anomalous
-
-    Returns
-    -------
-    signals : np.ndarray, shape (594, 61440)  float32
-    labels  : np.ndarray, shape (594,)         int32
-    """
-    import csv
-
+def load_valid_h5(filepath, label_csv):
     fname = os.path.basename(filepath)
-    group = os.path.splitext(fname)[0]          # "dfvalid"
-    key   = f"{group}/block0_values"
-
-    print(f"\n[H5] Loading validation file: {fname}")
+    group = os.path.splitext(fname)[0]
     with h5py.File(filepath, 'r') as f:
-        signals = np.array(f[key], dtype=np.float32)
-
-    # Load labels from CSV — robust to varied column names
-    print(f"[CSV] Loading labels from: {os.path.basename(label_csv)}")
+        signals = np.array(f[f'{group}/block0_values'], dtype=np.float32)
     labels = np.zeros(len(signals), dtype=np.int32)
-
     with open(label_csv, 'r') as f:
         reader = csv.DictReader(f)
-        # Normalise column names to lowercase
         for row in reader:
-            row_lower = {k.lower().strip(): v for k, v in row.items()}
-            # Find seqID column
-            seq_id = None
-            for col in ['seqid', 'seq_id', 'id', 'index']:
-                if col in row_lower:
-                    seq_id = int(row_lower[col])
-                    break
-            # Find anomaly column
-            anomaly = None
-            for col in ['anomaly', 'label', 'fault', 'y']:
-                if col in row_lower:
-                    anomaly = int(float(row_lower[col]))
-                    break
-            if seq_id is not None and anomaly is not None:
-                if seq_id < len(labels):
-                    labels[seq_id] = anomaly
-
+            r = {k.lower().strip(): v for k, v in row.items()}
+            sid = int(float(r.get('seqid', r.get('id', 0))))
+            lbl = int(float(r.get('anomaly', r.get('label', 0))))
+            if sid < len(labels):
+                labels[sid] = lbl
     counts = np.bincount(labels)
-    print(f"[CSV] Labels loaded — Healthy: {counts[0]}, Anomalous: {counts[1]}")
-    print(f"[H5] Validation signals: {signals.shape}")
+    print(f"[DATA] Valid: {signals.shape}  "
+          f"Healthy={counts[0]}  Anomalous={counts[1]}")
     return signals, labels
 
 
-def load_h5_dataset(filepath: str, label_csv: str = None):
+# ============================================================
+# 3. SIGNAL FEATURE EXTRACTION
+# ============================================================
+"""
+Feature vector f(x) for one window x of length WINDOW_LEN:
+
+  f1 : RMS energy       = sqrt(mean(x²))
+  f2 : Peak-to-peak     = max(x) - min(x)
+  f3 : Kurtosis         = E[(x-μ)⁴] / σ⁴  (sensitive to impulsive faults)
+  f4 : Crest factor     = max(|x|) / RMS   (ratio of peak to RMS)
+  f5 : Zero crossing rate = # sign changes / length
+  f6 : Spectral entropy = -Σ p_i log(p_i)  where p_i = PSD_i / Σ PSD
+  f7 : Dominant frequency = argmax(|FFT(x)|²)  in Hz
+  f8 : Band energy ratio = energy(0-100Hz) / energy(total)
+       (rotor harmonics concentrate below 100Hz in helicopters)
+
+These 8 features are computed per window then aggregated to sequence level
+by taking [mean, std, max] across all N_WINDOWS windows → 24-dim feature vector.
+
+Why these features:
+- RMS + peak-to-peak: directly capture the 10-30x amplitude anomaly we saw
+- Kurtosis: classic bearing fault indicator, sensitive to impulses
+- Crest factor: ratio-based, robust to operating condition changes
+- Spectral entropy: healthy signals have structured spectra (low entropy);
+  faults add broadband noise (high entropy)
+- Dominant freq + band energy: rotor imbalance shifts spectral content
+"""
+
+def extract_window_features(window: np.ndarray) -> np.ndarray:
     """
-    Unified loader. Auto-detects train vs validation by filename.
-    Pass label_csv only for the validation file.
+    Extract 8 features from one window of WINDOW_LEN samples.
+    Returns np.ndarray of shape (8,).
     """
-    if 'train' in os.path.basename(filepath).lower():
-        return load_train_h5(filepath)
-    else:
-        assert label_csv is not None, "label_csv required for validation file"
-        return load_valid_h5(filepath, label_csv)
+    n   = len(window)
+    eps = 1e-12
+
+    # f1: RMS energy
+    rms = np.sqrt(np.mean(window ** 2))
+
+    # f2: Peak-to-peak amplitude
+    p2p = window.max() - window.min()
+
+    # f3: Kurtosis
+    kurt = kurtosis(window, fisher=True)   # excess kurtosis (0 for Gaussian)
+
+    # f4: Crest factor
+    crest = np.max(np.abs(window)) / (rms + eps)
+
+    # f5: Zero crossing rate
+    zcr = np.sum(np.diff(np.sign(window)) != 0) / n
+
+    # f6, f7, f8: Spectral features via FFT
+    fft_mag  = np.abs(np.fft.rfft(window * np.hanning(n)))
+    freqs    = np.fft.rfftfreq(n, d=1.0/FS)
+    psd      = fft_mag ** 2
+    psd_norm = psd / (psd.sum() + eps)
+
+    # Spectral entropy
+    spec_ent = -np.sum(psd_norm * np.log(psd_norm + eps))
+
+    # Dominant frequency (Hz)
+    dom_freq = freqs[np.argmax(psd)]
+
+    # Band energy ratio: energy below 100 Hz / total
+    low_band_mask = freqs <= 100.0
+    band_ratio    = psd[low_band_mask].sum() / (psd.sum() + eps)
+
+    return np.array([rms, p2p, kurt, crest, zcr,
+                     spec_ent, dom_freq, band_ratio], dtype=np.float32)
+
+
+def extract_sequence_features(signal: np.ndarray) -> np.ndarray:
+    """
+    Extract feature vector for one full sequence.
+
+    For each of N_WINDOWS windows, compute 8 features.
+    Aggregate across windows using [mean, std, max] → 24-dim vector.
+
+    The aggregation captures:
+    - mean: typical operating condition
+    - std:  variability (faults increase variability)
+    - max:  worst-case window (catches localized fault bursts)
+    """
+    window_feats = np.zeros((N_WINDOWS, 8), dtype=np.float32)
+    for w in range(N_WINDOWS):
+        window = signal[w * WINDOW_LEN : (w + 1) * WINDOW_LEN]
+        window_feats[w] = extract_window_features(window)
+
+    # Aggregate: mean, std, max across windows → (24,)
+    feat_mean = window_feats.mean(axis=0)
+    feat_std  = window_feats.std(axis=0)
+    feat_max  = window_feats.max(axis=0)
+
+    return np.concatenate([feat_mean, feat_std, feat_max])
+
+
+def extract_dataset_features(signals: np.ndarray,
+                              desc: str = "Extracting features") -> np.ndarray:
+    """
+    Extract 24-dim feature vectors for all sequences.
+    Returns np.ndarray of shape (N_sequences, 24).
+    """
+    print(f"\n[FEATURES] {desc} for {len(signals)} sequences...")
+    t0 = time.time()
+    features = np.zeros((len(signals), 24), dtype=np.float32)
+    for i, sig in enumerate(signals):
+        features[i] = extract_sequence_features(sig)
+        if (i + 1) % 200 == 0:
+            elapsed = time.time() - t0
+            eta = elapsed / (i + 1) * (len(signals) - i - 1)
+            print(f"  {i+1}/{len(signals)}  elapsed={elapsed:.0f}s  "
+                  f"ETA={eta:.0f}s")
+    print(f"  Done in {time.time()-t0:.1f}s  shape={features.shape}")
+    return features
 
 
 # ============================================================
-# 3. PREPROCESSING & SCALOGRAM ENCODING
+# 4. FEATURE NAMES (for interpretability)
 # ============================================================
 
-def compute_global_stats(train_signals: np.ndarray):
-    """
-    Compute dataset-level mean and std for z-score normalization.
-    Using global stats (not per-sample) preserves inter-sample relationships.
-    This is the key modification from the paper — normalization must be
-    computed on training set and applied identically to test + attacked signals.
-    """
-    mu  = train_signals.mean()
-    std = train_signals.std()
-    print(f"[PREPROC] Global μ={mu:.4f}, σ={std:.4f}")
-    return mu, std
-
-
-def normalize(signals: np.ndarray, mu: float, std: float) -> np.ndarray:
-    return (signals - mu) / (std + 1e-8)
-
-
-def scalogram_encode(window: np.ndarray, n_scales: int = N_SCALES,
-                     img_size: int = IMG_SIZE) -> np.ndarray:
-    """
-    Compute STFT spectrogram magnitude for one window.
-
-    scipy.signal.cwt was removed in SciPy 1.12. We use STFT spectrogram
-    which is the second-best performer in the paper (AUC 91%, F1 91%).
-    Install PyWavelets (pip install PyWavelets) to restore true CWT.
-
-    SP[f, t] = |STFT(x)[f, t]|  where window=Hann(126), stride=8
-    Output: (64, 64) float32, normalized to [0,1] in log scale.
-    """
-    nperseg  = 126
-    noverlap = 118  # stride = 8
-    _, _, Zxx = sp_signal.stft(window, fs=FS, window='hann',
-                               nperseg=nperseg, noverlap=noverlap)
-    mag = np.abs(Zxx)   # shape: (64, T_out)
-
-    # Trim/pad time axis to img_size
-    if mag.shape[1] >= img_size:
-        mag = mag[:, :img_size]
-    else:
-        mag = np.pad(mag, ((0, 0), (0, img_size - mag.shape[1])), mode='edge')
-
-    # Trim freq axis to img_size
-    mag = mag[:img_size, :]
-
-    # Log scale for dynamic range
-    mag = np.log1p(mag)
-
-    # Normalize to [0, 1]
-    mn, mx = mag.min(), mag.max()
-    if mx > mn:
-        mag = (mag - mn) / (mx - mn)
-
-    return mag.astype(np.float32)
-
-
-def encode_dataset(signals: np.ndarray, mu: float, std: float,
-                   desc: str = "Encoding") -> np.ndarray:
-    """
-    Full pipeline: normalize → window → scalogram encode.
-
-    Returns
-    -------
-    images : np.ndarray, shape (N * N_WINDOWS, 1, IMG_SIZE, IMG_SIZE)
-    """
-    norm_signals = normalize(signals, mu, std)
-    all_images = []
-
-    for sig in tqdm(norm_signals, desc=desc):
-        for w in range(N_WINDOWS):
-            window = sig[w * WINDOW_LEN : (w + 1) * WINDOW_LEN]
-            img = scalogram_encode(window)
-            all_images.append(img)
-
-    images = np.array(all_images, dtype=np.float32)
-    images = images[:, np.newaxis, :, :]    # add channel dim → (N, 1, 64, 64)
-    print(f"[ENCODE] {desc}: output shape {images.shape}")
-    return images
+FEATURE_NAMES = []
+for stat in ['mean', 'std', 'max']:
+    for feat in ['RMS', 'P2P', 'Kurtosis', 'Crest',
+                 'ZCR', 'SpecEnt', 'DomFreq', 'BandRatio']:
+        FEATURE_NAMES.append(f"{feat}_{stat}")
 
 
 # ============================================================
-# 4. CONVOLUTIONAL AUTOENCODER (CAE) — 2D
+# 5. ANOMALY DETECTOR — ENSEMBLE
 # ============================================================
-# Architecture matches Table 1 of reference paper (2D-CAE variant).
-# Encoder: two conv layers → flatten → bottleneck
-# Decoder: mirror of encoder
+"""
+Detector architecture: ensemble of two one-class classifiers.
 
-class ConvEncoder(nn.Module):
-    def __init__(self, bottleneck: int = BOTTLENECK):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(1, 64, kernel_size=2, stride=2),   # 64×32×32
-            nn.LeakyReLU(0.3),
-            nn.Conv2d(64, 128, kernel_size=2, stride=2), # 128×16×16
-            nn.LeakyReLU(0.3),
+1. Isolation Forest (Liu et al. 2008)
+   - Builds random trees that isolate points
+   - Anomalies are isolated in fewer splits (shorter path length)
+   - Robust to high-dimensional data, no distributional assumption
+   - contamination=0.01: expects ~1% of training data to be outliers
+
+2. One-Class SVM (Schölkopf et al. 2001)
+   - Learns a hypersphere in kernel space enclosing healthy data
+   - RBF kernel captures nonlinear healthy manifold
+   - nu=0.05: at most 5% of training samples are support vectors
+
+Ensemble decision: average of normalized scores from both detectors.
+This reduces variance and improves robustness over either alone.
+
+Formal anomaly score:
+    A(x) = 0.5 · A_IF(f(x)) + 0.5 · A_OCSVM(f(x))
+where f(x) is the 24-dim feature vector.
+Detection: flag as anomalous if A(x) > τ
+"""
+
+class FDIADetector:
+    def __init__(self):
+        self.iso_forest = IsolationForest(
+            n_estimators=200,
+            max_samples='auto',
+            contamination=0.01,
+            random_state=SEED,
+            n_jobs=-1
         )
-        self.flatten_dim = 128 * 16 * 16   # = 32768
-        self.fc = nn.Sequential(
-            nn.Linear(self.flatten_dim, bottleneck),
-            nn.LeakyReLU(0.3),
+        self.ocsvm = OneClassSVM(
+            kernel='rbf',
+            nu=0.05,
+            gamma='scale'
         )
+        self.scaler = StandardScaler()
+        self.tau    = None
+        self.is_fit = False
 
-    def forward(self, x):
-        x = self.conv(x)
-        x = x.view(x.size(0), -1)
-        return self.fc(x)
+    def fit(self, features: np.ndarray):
+        """
+        Train detector on healthy-only feature vectors.
+        Scales features, fits both detectors.
+        """
+        print("\n[DETECTOR] Fitting on healthy training features...")
+        X = self.scaler.fit_transform(features)
 
+        print("  Fitting Isolation Forest...")
+        self.iso_forest.fit(X)
 
-class ConvDecoder(nn.Module):
-    def __init__(self, bottleneck: int = BOTTLENECK):
-        super().__init__()
-        self.flatten_dim = 128 * 16 * 16
-        self.fc = nn.Sequential(
-            nn.Linear(bottleneck, self.flatten_dim),
-            nn.LeakyReLU(0.3),
-        )
-        self.deconv = nn.Sequential(
-            nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2),
-            nn.LeakyReLU(0.3),
-            nn.ConvTranspose2d(64, 1, kernel_size=2, stride=2),
-            nn.Sigmoid(),   # output in [0, 1]
-        )
+        print("  Fitting One-Class SVM...")
+        self.ocsvm.fit(X)
 
-    def forward(self, z):
-        x = self.fc(z)
-        x = x.view(x.size(0), 128, 16, 16)
-        return self.deconv(x)
+        self.is_fit = True
+        print("[DETECTOR] Fitting complete.")
 
+    def score(self, features: np.ndarray) -> np.ndarray:
+        """
+        Compute anomaly scores for feature vectors.
+        Higher score = more anomalous.
 
-class CAE(nn.Module):
-    def __init__(self, bottleneck: int = BOTTLENECK):
-        super().__init__()
-        self.encoder = ConvEncoder(bottleneck)
-        self.decoder = ConvDecoder(bottleneck)
+        Isolation Forest: score_samples returns negative average path length
+        (more negative = more anomalous). We negate to get positive anomaly score.
 
-    def forward(self, x):
-        z = self.encoder(x)
-        return self.decoder(z)
+        OCSVM: decision_function returns signed distance from boundary
+        (more negative = more anomalous). We negate.
 
+        Both are then min-max normalized to [0,1] using training distribution,
+        then averaged.
+        """
+        assert self.is_fit, "Detector not fitted yet"
+        X = self.scaler.transform(features)
 
-# ============================================================
-# 5. TRAINING
-# ============================================================
+        # Raw scores (higher = more anomalous after negation)
+        if_scores   = -self.iso_forest.score_samples(X)
+        svm_scores  = -self.ocsvm.decision_function(X)
 
-def train_cae(train_images: np.ndarray) -> tuple:
-    """
-    Train CAE on healthy-only scalogram images.
-    Loss: MSE between input and reconstruction (standard for anomaly detection CAE).
-    Returns trained model and per-epoch loss history.
-    """
-    dataset = TensorDataset(torch.from_numpy(train_images))
-    loader  = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
-                         num_workers=0, pin_memory=False)
+        # Normalize using training distribution stats stored at calibration
+        if_norm  = (if_scores  - self._if_min)  / (self._if_range  + 1e-8)
+        svm_norm = (svm_scores - self._svm_min) / (self._svm_range + 1e-8)
 
-    model = CAE().to(DEVICE)
-    optimizer = optim.Adam(model.parameters(), lr=LR, betas=(0.9, 0.999))
-    criterion = nn.MSELoss()
+        return 0.5 * if_norm + 0.5 * svm_norm
 
-    loss_history = []
-    print(f"\n[TRAIN] Starting CAE training for {EPOCHS} epochs...")
+    def calibrate_threshold(self, train_features: np.ndarray,
+                            percentile: int = 95) -> float:
+        """
+        Set detection threshold τ at Q-th percentile of training anomaly scores.
+        Also stores normalization stats for score().
 
-    for epoch in range(1, EPOCHS + 1):
-        model.train()
-        epoch_loss = 0.0
-        for (batch,) in loader:
-            batch = batch.to(DEVICE)
-            recon = model(batch)
-            loss  = criterion(recon, batch)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item() * batch.size(0)
-        avg_loss = epoch_loss / len(dataset)
-        loss_history.append(avg_loss)
-        print(f"  Epoch [{epoch:02d}/{EPOCHS}]  Loss: {avg_loss:.6f}")
+        Using Q=95 (vs paper's Q=99) because ensemble scores have lower variance
+        than single-model reconstruction residuals.
+        """
+        X = self.scaler.transform(train_features)
 
-    return model, loss_history
+        if_scores  = -self.iso_forest.score_samples(X)
+        svm_scores = -self.ocsvm.decision_function(X)
+
+        # Store normalization stats
+        self._if_min   = if_scores.min()
+        self._if_range = if_scores.max() - if_scores.min()
+        self._svm_min  = svm_scores.min()
+        self._svm_range = svm_scores.max() - svm_scores.min()
+
+        # Compute ensemble scores on training set
+        train_scores = self.score(train_features)
+        self.tau = np.percentile(train_scores, percentile)
+        print(f"[DETECTOR] τ = {self.tau:.4f}  (Q={percentile})")
+        return self.tau
 
 
 # ============================================================
-# 6. RESIDUAL COMPUTATION & THRESHOLD CALIBRATION
+# 6. EVALUATION
 # ============================================================
 
-def compute_residuals(model: CAE, images: np.ndarray,
-                      batch_size: int = 256) -> np.ndarray:
+def evaluate(scores: np.ndarray, labels: np.ndarray,
+             tau: float, tag: str = "") -> dict:
     """
-    Compute L1 reconstruction residual per image.
-
-    Res_k = Σ_i |x^i_or - x^i_rc|    (Equation 1 from reference paper)
-
-    Returns array of shape (N_images,).
-    """
-    model.eval()
-    residuals = []
-    dataset = TensorDataset(torch.from_numpy(images))
-    loader  = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-
-    with torch.no_grad():
-        for (batch,) in loader:
-            batch = batch.to(DEVICE)
-            recon = model(batch)
-            # L1 residual per image
-            res = (batch - recon).abs().sum(dim=(1, 2, 3))
-            residuals.append(res.cpu().numpy())
-
-    return np.concatenate(residuals)
-
-
-def residuals_to_sequence_scores(residuals: np.ndarray,
-                                 n_windows: int = N_WINDOWS) -> np.ndarray:
-    """
-    Aggregate per-window residuals to per-sequence anomaly score.
-    Strategy: max residual over all windows of a sequence.
-    (Matches paper: "we monitor the maximum residual over its sub-series")
-
-    Returns array of shape (N_sequences,).
-    """
-    n_seqs = len(residuals) // n_windows
-    residuals = residuals[:n_seqs * n_windows].reshape(n_seqs, n_windows)
-    return residuals.max(axis=1)
-
-
-def calibrate_threshold(train_residuals: np.ndarray,
-                        percentile: int = THRESHOLD_Q) -> float:
-    """
-    Set detection threshold τ as the Q-th percentile of training residuals.
-    Using Q=99 matches the paper. In practice, calibrate on a held-out
-    healthy validation split to avoid threshold leakage.
-    """
-    tau = np.percentile(train_residuals, percentile)
-    print(f"[THRESHOLD] τ = {tau:.4f}  (Q={percentile} of training residuals)")
-    return tau
-
-
-# ============================================================
-# 7. PHASE 1 EVALUATION — Healthy vs. Natural Faults
-# ============================================================
-
-def evaluate_detector(scores: np.ndarray, labels: np.ndarray,
-                      tau: float, tag: str = "Phase 1"):
-    """
-    Compute TPR, FPR, F1, AUC given sequence-level anomaly scores and labels.
-    Prints a paper-ready results table row.
+    Compute TPR, FPR, F1, AUC. Print results row.
     """
     preds = (scores > tau).astype(int)
 
@@ -451,148 +377,102 @@ def evaluate_detector(scores: np.ndarray, labels: np.ndarray,
     fn = np.sum((preds == 0) & (labels == 1))
     tn = np.sum((preds == 0) & (labels == 0))
 
-    tpr  = tp / (tp + fn + 1e-9)
-    fpr  = fp / (fp + tn + 1e-9)
-    f1   = f1_score(labels, preds, zero_division=0)
-    auc  = roc_auc_score(labels, scores)
+    tpr = tp / (tp + fn + 1e-9)
+    fpr = fp / (fp + tn + 1e-9)
+    f1  = f1_score(labels, preds, zero_division=0)
+    auc = roc_auc_score(labels, scores)
 
-    print(f"\n{'='*50}")
-    print(f"  [{tag}] RESULTS")
-    print(f"{'='*50}")
-    print(f"  TPR  : {tpr*100:.1f}%")
-    print(f"  FPR  : {fpr*100:.1f}%")
-    print(f"  F1   : {f1*100:.1f}%")
-    print(f"  AUC  : {auc*100:.1f}%")
-    print(f"  TP={tp}  FP={fp}  FN={fn}  TN={tn}")
-    print(f"{'='*50}")
+    print(f"  {tag:<30} TPR={tpr*100:5.1f}%  FPR={fpr*100:5.1f}%  "
+          f"F1={f1*100:5.1f}%  AUC={auc*100:5.1f}%")
 
-    return {"tpr": tpr, "fpr": fpr, "f1": f1, "auc": auc,
-            "preds": preds, "scores": scores, "labels": labels}
+    return dict(tpr=tpr, fpr=fpr, f1=f1, auc=auc,
+                preds=preds, scores=scores, labels=labels,
+                tp=tp, fp=fp, fn=fn, tn=tn)
 
 
 # ============================================================
-# 8. ADVERSARIAL ATTACK INJECTION  —  FDIA THREAT MODEL
+# 7. FDIA ATTACK INJECTION
 # ============================================================
 """
-THREAT MODEL (paper Section II, formal definition):
+THREAT MODEL (formal, for paper Section II)
+-------------------------------------------
+Attacker goal      : Evasion — inject signal δ into healthy sensor reading x
+                     such that the compromised reading x̃ = x + δ is classified
+                     as healthy (false negative), hiding a fault condition.
 
-    Attacker goal      : Evasion — cause healthy sensor readings to be
-                         misclassified as healthy, hiding an injected fault.
-                         (False-negative attack on the detector.)
+Attacker capability: Additive perturbation at sensor/DAQ level.
+                     Constraint: ||δ||_∞ ≤ ε · σ_train
+                     where σ_train = std of healthy training distribution.
 
-    Attacker knowledge : Black-box / gray-box — attacker knows the sensor
-                         modality and sampling rate but NOT the CAE weights.
+Attacker knowledge :
+  - Gaussian / Bias / Scaling : zero-knowledge (no model access)
+  - Replay                    : zero-knowledge + historical data access
+  - FGSM-like                 : gray-box (knows feature extraction process,
+                                not detector weights)
 
-    Attacker capability: Can inject additive signal δ(t) at the sensor bus
-                         (e.g., compromised DAQ firmware or sensor spoofing).
-                         Constraint: ||δ||_∞ ≤ ε·σ_x
-                         where σ_x = std of the healthy training distribution.
-
-    Five attack types implemented below cover the standard FDIA taxonomy:
-    1. Gaussian noise injection         — stochastic, broadband
-    2. Bias / DC offset injection       — persistent scalar shift
-    3. Scaling attack                   — multiplicative gain perturbation
-    4. Replay attack                    — substitute a past healthy window
-    5. FGSM-like gradient attack        — worst-case additive perturbation
-       (approximated without model access using signal gradient proxy)
+Five attack types cover the standard ICS/avionics FDIA taxonomy:
+  Type I   : Stochastic noise injection (Gaussian)
+  Type II  : Persistent bias / DC offset injection
+  Type III : Multiplicative gain manipulation
+  Type IV  : Replay attack (historical healthy data substitution)
+  Type V   : Gradient-based spectral evasion (FGSM-inspired)
 """
 
-def attack_gaussian_noise(signal: np.ndarray, epsilon: float,
-                          sigma: float) -> np.ndarray:
-    """
-    δ(t) ~ N(0, (ε·σ)²)
-    Broadband stochastic attack. Models sensor quantization noise injection.
-    """
-    noise = np.random.normal(0, epsilon * sigma, size=signal.shape)
-    return signal + noise
+def attack_gaussian_noise(signal, epsilon, sigma):
+    """Type I: δ(t) ~ N(0, (ε·σ)²)"""
+    return signal + np.random.normal(0, epsilon * sigma, signal.shape)
 
 
-def attack_bias_injection(signal: np.ndarray, epsilon: float,
-                          sigma: float) -> np.ndarray:
-    """
-    δ(t) = ε·σ·sign(U)  where U ~ Uniform(-1,1)
-    Constant DC offset. Models compromised sensor zero-point calibration.
-    """
-    bias = epsilon * sigma * np.sign(np.random.uniform(-1, 1))
-    return signal + bias
+def attack_bias_injection(signal, epsilon, sigma):
+    """Type II: δ(t) = ε·σ·sign(U), U~Uniform(-1,1)"""
+    return signal + epsilon * sigma * np.sign(np.random.uniform(-1, 1))
 
 
-def attack_scaling(signal: np.ndarray, epsilon: float,
-                   sigma: float) -> np.ndarray:
-    """
-    x̃(t) = (1 + ε·α) · x(t),  α ~ Uniform(-1, 1)
-    Multiplicative gain attack. Models compromised amplifier/ADC scaling.
-    Note: this violates the L∞ additive model for large signals — we clip.
-    """
+def attack_scaling(signal, epsilon, sigma):
+    """Type III: x̃(t) = (1 + ε·α)·x(t), α~Uniform(-1,1), clipped to L∞ budget"""
     alpha = np.random.uniform(-1, 1)
-    scale = 1.0 + epsilon * alpha
-    perturbed = signal * scale
-    # Clip so ||δ||_∞ ≤ ε·σ
-    delta = perturbed - signal
-    delta = np.clip(delta, -epsilon * sigma, epsilon * sigma)
+    delta = np.clip(signal * epsilon * alpha,
+                    -epsilon * sigma, epsilon * sigma)
     return signal + delta
 
 
-def attack_replay(signal: np.ndarray, replay_bank: np.ndarray) -> np.ndarray:
+def attack_replay(signal, replay_bank):
+    """Type IV: substitute randomly selected healthy recording"""
+    return replay_bank[np.random.randint(len(replay_bank))].copy()
+
+
+def attack_fgsm_like(signal, epsilon, sigma):
     """
-    Replace signal with a randomly selected healthy signal from replay bank.
-    Models replay attack: adversary records healthy data and re-injects it
-    to mask an actual fault condition.
+    Type V: Gray-box FGSM-inspired attack.
+
+    Perturbs signal in direction that maximally changes the feature vector,
+    approximating ∇_x ||f(x)||² via finite differences.
+
+    δ(t) = ε·σ·sign(∂/∂x_t [Σ_i f_i(x)²])
+
+    This targets the feature extractor directly without requiring access
+    to the detector's decision boundary (gray-box assumption).
     """
-    idx = np.random.randint(0, len(replay_bank))
-    return replay_bank[idx].copy()
-
-
-def attack_fgsm_like(signal: np.ndarray, epsilon: float,
-                     sigma: float) -> np.ndarray:
-    """
-    FGSM-inspired perturbation without model access.
-    Approximation: perturb in the direction that maximally changes the
-    signal's local spectral energy (proxy for reconstruction difficulty).
-
-    δ(t) = ε·σ·sign(∇_x ||STFT(x)||²)
-    Gradient approximated via finite difference on spectral energy.
-
-    In the paper this will be described as a gray-box spectral evasion attack.
-    """
-    # Compute spectral energy gradient proxy via finite differences
-    eps_fd = 1e-4
-    f, _, Zxx = sp_signal.stft(signal, fs=FS, nperseg=64)
-    energy_orig = np.abs(Zxx).sum()
-
-    grad = np.zeros_like(signal)
-    # Approximate gradient at 32 random time points (tractable on CPU)
-    indices = np.random.choice(len(signal), size=min(32, len(signal)), replace=False)
-    for i in indices:
-        sig_plus = signal.copy()
-        sig_plus[i] += eps_fd
-        _, _, Zxx_plus = sp_signal.stft(sig_plus, fs=FS, nperseg=64)
-        energy_plus = np.abs(Zxx_plus).sum()
-        grad[i] = (energy_plus - energy_orig) / eps_fd
-
+    eps_fd    = sigma * 1e-3
+    f0        = extract_sequence_features(signal)
+    grad      = np.zeros_like(signal)
+    # Sample 64 time points for tractable finite difference
+    idx       = np.random.choice(len(signal), size=64, replace=False)
+    for i in idx:
+        sp        = signal.copy()
+        sp[i]    += eps_fd
+        fp        = extract_sequence_features(sp)
+        grad[i]   = np.sum((fp - f0) ** 2) / eps_fd
     delta = epsilon * sigma * np.sign(grad)
     return signal + delta
 
 
-def inject_attacks(healthy_signals: np.ndarray, train_signals: np.ndarray,
-                   attack_type: str, epsilon: float = EPSILON) -> np.ndarray:
-    """
-    Apply a specified attack to all signals in healthy_signals.
-
-    Parameters
-    ----------
-    healthy_signals : (N, SEQ_LEN) — normalized healthy test signals
-    train_signals   : (N, SEQ_LEN) — training signals (used as replay bank)
-    attack_type     : one of ATTACK_TYPES
-    epsilon         : L∞ budget as fraction of training std
-
-    Returns
-    -------
-    attacked_signals : (N, SEQ_LEN) — perturbed signals
-    """
-    sigma = train_signals.std()
+def inject_attacks(healthy_signals, train_signals, attack_type,
+                   epsilon=EPSILON):
+    """Apply attack to all signals. Returns attacked array."""
+    sigma   = train_signals.std()
     attacked = np.zeros_like(healthy_signals)
-
+    print(f"  Injecting [{attack_type}]  ε={epsilon}  σ_train={sigma:.4f}")
     for i, sig in enumerate(healthy_signals):
         if attack_type == "gaussian_noise":
             attacked[i] = attack_gaussian_noise(sig, epsilon, sigma)
@@ -604,144 +484,249 @@ def inject_attacks(healthy_signals: np.ndarray, train_signals: np.ndarray,
             attacked[i] = attack_replay(sig, train_signals)
         elif attack_type == "fgsm_like":
             attacked[i] = attack_fgsm_like(sig, epsilon, sigma)
-        else:
-            raise ValueError(f"Unknown attack type: {attack_type}")
-
     return attacked
+
+
+# ============================================================
+# 8. GOODFELLOW ADVERSARIAL TRAINING
+# ============================================================
+"""
+Adversarial training (Goodfellow et al. 2015) adapted to one-class detection:
+
+Original formulation (for classifiers):
+    J̃(θ,x,y) = α·J(θ,x,y) + (1-α)·J(θ, x+ε·sign(∇_xJ), y)
+
+Our adaptation for one-class feature-space detector:
+    We augment the training feature set with adversarially perturbed features:
+    F̃_train = α·F_healthy ∪ (1-α)·F_attacked
+
+    where F_attacked are features extracted from signals perturbed by
+    FGSM-like attack at budget ε_adv.
+
+    The detector is then refitted on F̃_train. This forces the detector to
+    learn a decision boundary that is robust to the worst-case perturbations
+    an attacker can apply within budget ε_adv.
+
+    α = 0.5 matches Goodfellow et al.'s best reported hyperparameter.
+
+Why this works for anomaly detection:
+    The Isolation Forest and OCSVM learn the boundary of the healthy manifold.
+    Adversarial training expands this boundary in the directions most vulnerable
+    to perturbation, making it harder for an attacker to push a perturbed signal
+    outside the boundary without exceeding the L∞ budget.
+"""
+
+def generate_adversarial_features(train_signals: np.ndarray,
+                                   train_features: np.ndarray,
+                                   detector: FDIADetector,
+                                   epsilon: float = ADV_EPSILON) -> np.ndarray:
+    """
+    Generate adversarially perturbed feature vectors for adversarial training.
+
+    For each healthy training signal, apply FGSM-like perturbation and
+    extract features from the perturbed signal.
+
+    Returns adversarial feature matrix of same shape as train_features.
+    """
+    print(f"\n[ADV TRAIN] Generating adversarial features  ε={epsilon}...")
+    sigma     = train_signals.std()
+    adv_feats = np.zeros_like(train_features)
+
+    for i, sig in enumerate(train_signals):
+        attacked     = attack_fgsm_like(sig, epsilon, sigma)
+        adv_feats[i] = extract_sequence_features(attacked)
+        if (i + 1) % 200 == 0:
+            print(f"  {i+1}/{len(train_signals)}")
+
+    print(f"  Adversarial features shape: {adv_feats.shape}")
+    return adv_feats
+
+
+def adversarial_train(train_signals: np.ndarray,
+                      train_features: np.ndarray,
+                      alpha: float = ADV_ALPHA,
+                      epsilon: float = ADV_EPSILON) -> FDIADetector:
+    """
+    Retrain detector on mixture of clean and adversarial features.
+
+    Mixed training set:
+        F̃ = [F_clean (α fraction)] ∪ [F_adversarial (1-α fraction)]
+
+    Returns new hardened detector.
+    """
+    print(f"\n[ADV TRAIN] Adversarial training  α={alpha}  ε={epsilon}")
+
+    # Generate adversarial features
+    adv_features = generate_adversarial_features(
+        train_signals, train_features, None, epsilon
+    )
+
+    # Mix: α clean + (1-α) adversarial
+    n_clean = int(alpha * len(train_features))
+    n_adv   = len(train_features) - n_clean
+
+    clean_idx = np.random.choice(len(train_features), n_clean, replace=False)
+    adv_idx   = np.random.choice(len(adv_features),   n_adv,   replace=False)
+
+    mixed_features = np.vstack([
+        train_features[clean_idx],
+        adv_features[adv_idx]
+    ])
+
+    print(f"[ADV TRAIN] Mixed set: {n_clean} clean + {n_adv} adversarial "
+          f"= {len(mixed_features)} total")
+
+    # Refit detector on mixed set
+    hardened = FDIADetector()
+    hardened.fit(mixed_features)
+    hardened.calibrate_threshold(mixed_features, percentile=95)
+
+    return hardened
 
 
 # ============================================================
 # 9. VISUALIZATION
 # ============================================================
 
-def plot_training_loss(loss_history: list):
-    plt.figure(figsize=(7, 4))
-    plt.plot(loss_history, marker='o', linewidth=2)
-    plt.xlabel("Epoch")
-    plt.ylabel("MSE Loss")
-    plt.title("CAE Training Loss (Healthy Data Only)")
-    plt.grid(True, alpha=0.4)
+def plot_feature_distributions(train_feats, test_feats, test_labels,
+                                n_features=8):
+    """
+    Plot distribution of each feature for healthy vs anomalous sequences.
+    Shows which features are most discriminative.
+    """
+    fig, axes = plt.subplots(2, 4, figsize=(16, 8))
+    axes = axes.flatten()
+
+    healthy_feats  = test_feats[test_labels == 0]
+    anomaly_feats  = test_feats[test_labels == 1]
+    feat_names_short = [n.replace('_mean','') for n in FEATURE_NAMES[:8]]
+
+    for i in range(n_features):
+        ax = axes[i]
+        # Use mean aggregation features (first 8)
+        h_vals = healthy_feats[:, i]
+        a_vals = anomaly_feats[:, i]
+        t_vals = train_feats[:, i]
+
+        bins = np.linspace(
+            min(h_vals.min(), a_vals.min()),
+            min(max(h_vals.max(), a_vals.max()),
+                np.percentile(a_vals, 99)),
+            40
+        )
+        ax.hist(t_vals, bins=bins, alpha=0.4, label='Train (healthy)',
+                color='gray', density=True)
+        ax.hist(h_vals, bins=bins, alpha=0.6, label='Test healthy',
+                color='steelblue', density=True)
+        ax.hist(a_vals, bins=bins, alpha=0.6, label='Test anomalous',
+                color='tomato', density=True)
+        ax.set_title(feat_names_short[i], fontsize=10)
+        ax.legend(fontsize=7)
+
+    plt.suptitle('Feature Distributions: Healthy vs Anomalous', fontsize=13)
     plt.tight_layout()
-    plt.savefig("training_loss.png", dpi=150)
+    plt.savefig('feature_distributions.png', dpi=150, bbox_inches='tight')
     plt.show()
-    print("[PLOT] Saved: training_loss.png")
+    print("[PLOT] Saved: feature_distributions.png")
 
 
 def plot_roc_curves(results_dict: dict):
-    """
-    Overlay ROC curves for Phase 1 (natural faults) and all attack types.
-    """
-    plt.figure(figsize=(8, 7))
+    plt.figure(figsize=(9, 7))
     colors = plt.cm.tab10(np.linspace(0, 1, len(results_dict)))
 
     for (tag, res), color in zip(results_dict.items(), colors):
         fpr_arr, tpr_arr, _ = roc_curve(res['labels'], res['scores'])
-        auc = res['auc']
-        plt.plot(fpr_arr, tpr_arr, label=f"{tag} (AUC={auc*100:.1f}%)",
-                 linewidth=2, color=color)
+        linestyle = '-' if 'Phase 3' in tag or 'Hardened' in tag else '--'
+        plt.plot(fpr_arr, tpr_arr,
+                 label=f"{tag}  (AUC={res['auc']*100:.1f}%)",
+                 linewidth=2, color=color, linestyle=linestyle)
 
-    plt.plot([0, 1], [0, 1], 'k--', linewidth=1, label='Random (AUC=50%)')
-    plt.xlabel("False Positive Rate")
-    plt.ylabel("True Positive Rate")
-    plt.title("ROC Curves — FDIA Detection Performance")
-    plt.legend(loc='lower right', fontsize=9)
+    plt.plot([0,1],[0,1],'k:',linewidth=1,label='Random (50%)')
+    plt.xlabel("False Positive Rate", fontsize=12)
+    plt.ylabel("True Positive Rate", fontsize=12)
+    plt.title("ROC Curves — FDIA Detection (solid=hardened, dashed=baseline)",
+              fontsize=12)
+    plt.legend(loc='lower right', fontsize=8)
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig("roc_curves.png", dpi=150)
+    plt.savefig('roc_curves.png', dpi=150)
     plt.show()
     print("[PLOT] Saved: roc_curves.png")
 
 
-def plot_residual_distributions(residual_dict: dict, tau: float):
-    """
-    Histogram of anomaly scores for healthy, natural faults, and each attack.
-    Vertical dashed line = threshold τ.
-    """
-    n = len(residual_dict)
-    fig, axes = plt.subplots(1, n, figsize=(5 * n, 4), sharey=False)
+def plot_score_distributions(results_dict: dict, tau: float,
+                              tau_hardened: float = None):
+    n   = len(results_dict)
+    fig, axes = plt.subplots(1, n, figsize=(5*n, 4), sharey=False)
     if n == 1:
         axes = [axes]
 
-    for ax, (tag, (scores, labels)) in zip(axes, residual_dict.items()):
-        healthy_s  = scores[labels == 0]
-        anomaly_s  = scores[labels == 1]
-        bins = np.linspace(scores.min(), np.percentile(scores, 99.5), 50)
-        ax.hist(healthy_s,  bins=bins, alpha=0.6, label='Healthy',   color='steelblue')
-        ax.hist(anomaly_s,  bins=bins, alpha=0.6, label='Anomalous', color='tomato')
-        ax.axvline(tau, color='black', linestyle='--', label=f'τ={tau:.1f}')
-        ax.set_title(tag, fontsize=10)
-        ax.set_xlabel("Anomaly Score (max residual)")
-        ax.legend(fontsize=8)
+    for ax, (tag, res) in zip(axes, results_dict.items()):
+        h = res['scores'][res['labels'] == 0]
+        a = res['scores'][res['labels'] == 1]
+        mn = min(h.min(), a.min())
+        mx = max(np.percentile(h,99.5), np.percentile(a,99.5))
+        bins = np.linspace(mn, mx, 50)
+        ax.hist(h, bins=bins, alpha=0.6, label='Healthy',   color='steelblue',
+                density=True)
+        ax.hist(a, bins=bins, alpha=0.6, label='Anomalous', color='tomato',
+                density=True)
+        ax.axvline(tau, color='black', linestyle='--',
+                   linewidth=1.5, label=f'τ={tau:.3f}')
+        if tau_hardened:
+            ax.axvline(tau_hardened, color='green', linestyle=':',
+                       linewidth=1.5, label=f'τ_hard={tau_hardened:.3f}')
+        ax.set_title(tag, fontsize=9)
+        ax.set_xlabel("Anomaly Score")
+        ax.legend(fontsize=7)
 
-    plt.suptitle("Residual Score Distributions", fontsize=13, y=1.02)
+    plt.suptitle("Anomaly Score Distributions", fontsize=13, y=1.01)
     plt.tight_layout()
-    plt.savefig("residual_distributions.png", dpi=150, bbox_inches='tight')
+    plt.savefig('score_distributions.png', dpi=150, bbox_inches='tight')
     plt.show()
-    print("[PLOT] Saved: residual_distributions.png")
+    print("[PLOT] Saved: score_distributions.png")
 
 
-def plot_attacked_signal(original: np.ndarray, attacked_dict: dict,
-                         mu: float, std: float, window: int = 0):
-    """
-    Visual comparison of original vs. attacked signal for one window.
-    Shows both time domain and scalogram side by side.
-    """
-    t = np.arange(WINDOW_LEN) / FS
-    n_attacks = len(attacked_dict)
-    fig = plt.figure(figsize=(5 * (n_attacks + 1), 6))
-    gs  = gridspec.GridSpec(2, n_attacks + 1)
+def plot_signal_examples(train_signals, test_signals, test_labels):
+    """Quick sanity check: plot healthy vs anomalous raw signals."""
+    h_idx = np.where(test_labels == 0)[0][:2]
+    a_idx = np.where(test_labels == 1)[0][:2]
+    t     = np.arange(2048) / FS
 
-    orig_window = original[window * WINDOW_LEN : (window + 1) * WINDOW_LEN]
-    orig_sc     = scalogram_encode(normalize(orig_window[np.newaxis], mu, std)[0])
+    fig, axes = plt.subplots(2, 2, figsize=(14, 6))
+    for i, idx in enumerate(h_idx):
+        axes[0,i].plot(t, test_signals[idx,:2048], linewidth=0.5,
+                       color='steelblue')
+        axes[0,i].set_title(f'Healthy seqID={idx}')
+        axes[0,i].set_ylabel('Amplitude')
+        axes[0,i].set_xlabel('Time (s)')
 
-    # Original
-    ax = fig.add_subplot(gs[0, 0])
-    ax.plot(t, orig_window, linewidth=0.8)
-    ax.set_title("Original")
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Amplitude")
+    for i, idx in enumerate(a_idx):
+        axes[1,i].plot(t, test_signals[idx,:2048], linewidth=0.5,
+                       color='tomato')
+        axes[1,i].set_title(f'Anomalous seqID={idx}')
+        axes[1,i].set_ylabel('Amplitude')
+        axes[1,i].set_xlabel('Time (s)')
 
-    ax2 = fig.add_subplot(gs[1, 0])
-    ax2.imshow(orig_sc, aspect='auto', origin='lower', cmap='viridis')
-    ax2.set_title("Scalogram")
-    ax2.set_xlabel("Time bins")
-    ax2.set_ylabel("Scale")
-
-    for col, (atk_name, atk_signal) in enumerate(attacked_dict.items(), start=1):
-        atk_window = atk_signal[window * WINDOW_LEN : (window + 1) * WINDOW_LEN]
-        atk_sc     = scalogram_encode(normalize(atk_window[np.newaxis], mu, std)[0])
-
-        ax = fig.add_subplot(gs[0, col])
-        ax.plot(t, atk_window, linewidth=0.8, color='tomato')
-        ax.set_title(f"Attack: {atk_name}")
-        ax.set_xlabel("Time (s)")
-
-        ax2 = fig.add_subplot(gs[1, col])
-        ax2.imshow(atk_sc, aspect='auto', origin='lower', cmap='viridis')
-        ax2.set_title("Scalogram")
-        ax2.set_xlabel("Time bins")
-
-    plt.suptitle("Original vs. Attacked Signals (time domain + scalogram)",
-                 fontsize=12)
+    plt.suptitle('Raw Signal: Healthy vs Anomalous', fontsize=13)
     plt.tight_layout()
-    plt.savefig("signal_comparison.png", dpi=150, bbox_inches='tight')
+    plt.savefig('raw_signals.png', dpi=150)
     plt.show()
-    print("[PLOT] Saved: signal_comparison.png")
+    print("[PLOT] Saved: raw_signals.png")
 
 
 def print_results_table(all_results: dict):
-    """
-    Print a LaTeX-ready results table for the paper.
-    """
-    print("\n" + "="*65)
-    print(f"  {'Condition':<25} {'TPR%':>6} {'FPR%':>6} {'F1%':>6} {'AUC%':>6}")
-    print("="*65)
+    print("\n" + "="*70)
+    print(f"  {'Condition':<32} {'TPR%':>6} {'FPR%':>6} "
+          f"{'F1%':>6} {'AUC%':>6}")
+    print("="*70)
     for tag, res in all_results.items():
-        print(f"  {tag:<25} {res['tpr']*100:>5.1f}  {res['fpr']*100:>5.1f}  "
-              f"{res['f1']*100:>5.1f}  {res['auc']*100:>5.1f}")
-    print("="*65)
+        marker = " ★" if res['auc'] >= 0.85 else ""
+        print(f"  {tag:<32} {res['tpr']*100:>5.1f}  {res['fpr']*100:>5.1f}  "
+              f"{res['f1']*100:>5.1f}  {res['auc']*100:>5.1f}{marker}")
+    print("="*70)
 
-    print("\n[LaTeX Table Row Format]")
+    print("\n[LaTeX]")
     for tag, res in all_results.items():
         print(f"  {tag} & {res['tpr']*100:.1f} & {res['fpr']*100:.1f} & "
               f"{res['f1']*100:.1f} & {res['auc']*100:.1f} \\\\")
@@ -753,155 +738,133 @@ def print_results_table(all_results: dict):
 
 def main():
     print("\n" + "="*60)
-    print("  FDIA PIPELINE — Airbus Helicopter Dataset")
+    print("  PROJECT SPECTRA — FDIA PIPELINE v2")
+    print("  Signal Processing + ML Approach")
     print("="*60)
 
     # ----------------------------------------------------------
-    # PHASE 1A: Load data
+    # LOAD DATA
     # ----------------------------------------------------------
-    print("\n[PHASE 1A] Loading dataset...")
-    train_signals, train_labels = load_h5_dataset(TRAIN_H5)
-    test_signals,  test_labels  = load_h5_dataset(TEST_H5, label_csv=LABEL_CSV)
+    print("\n[1] Loading data...")
+    train_signals, train_labels = load_train_h5(TRAIN_H5)
+    test_signals,  test_labels  = load_valid_h5(TEST_H5, LABEL_CSV)
 
-    # Sanity checks
-    assert train_signals.shape[1] == SEQ_LEN, \
-        f"Expected SEQ_LEN={SEQ_LEN}, got {train_signals.shape[1]}"
-    assert set(np.unique(train_labels)).issubset({0}), \
-        "Training set should be healthy-only (label=0)"
-    assert set(np.unique(test_labels)).issubset({0, 1}), \
-        "Test set should have labels 0 and 1"
+    # Quick sanity plot
+    plot_signal_examples(train_signals, test_signals, test_labels)
 
     # ----------------------------------------------------------
-    # PHASE 1B: Preprocessing
+    # FEATURE EXTRACTION
     # ----------------------------------------------------------
-    print("\n[PHASE 1B] Computing global normalization statistics...")
-    mu, std = compute_global_stats(train_signals)
+    print("\n[2] Extracting features...")
+    train_feats = extract_dataset_features(train_signals,
+                                           "Train feature extraction")
+    test_feats  = extract_dataset_features(test_signals,
+                                           "Test feature extraction")
+
+    print(f"\n  Train features: {train_feats.shape}")
+    print(f"  Test features:  {test_feats.shape}")
+    print(f"  Feature names:  {FEATURE_NAMES}")
+
+    # Feature distribution plot
+    plot_feature_distributions(train_feats, test_feats, test_labels)
 
     # ----------------------------------------------------------
-    # PHASE 1C: Scalogram encoding
+    # PHASE 1 — TRAIN DETECTOR + EVALUATE ON NATURAL FAULTS
     # ----------------------------------------------------------
-    print("\n[PHASE 1C] Encoding training set to scalograms...")
-    train_images = encode_dataset(train_signals, mu, std, desc="Train encode")
+    print("\n[3] Training anomaly detector...")
+    detector = FDIADetector()
+    detector.fit(train_feats)
+    tau = detector.calibrate_threshold(train_feats, percentile=95)
 
-    print("\n[PHASE 1C] Encoding test set to scalograms...")
-    test_images  = encode_dataset(test_signals,  mu, std, desc="Test encode")
-
-    # ----------------------------------------------------------
-    # PHASE 1D: Train CAE on healthy data
-    # ----------------------------------------------------------
-    print("\n[PHASE 1D] Training CAE...")
-    model, loss_history = train_cae(train_images)
-    plot_training_loss(loss_history)
-
-    # ----------------------------------------------------------
-    # PHASE 1E: Calibrate threshold on training residuals
-    # ----------------------------------------------------------
-    print("\n[PHASE 1E] Calibrating detection threshold τ...")
-    train_residuals = compute_residuals(model, train_images)
-    train_scores    = residuals_to_sequence_scores(train_residuals)
-    tau             = calibrate_threshold(train_residuals)
+    print("\n[4] Phase 1 evaluation — natural fault detection:")
+    test_scores = detector.score(test_feats)
+    p1_results  = evaluate(test_scores, test_labels, tau,
+                           tag="Phase 1: Natural Faults")
+    all_results = {"Phase 1: Natural Faults": p1_results}
+    score_dist_data = {"Natural Faults": p1_results}
 
     # ----------------------------------------------------------
-    # PHASE 1F: Evaluate on test set (natural faults)
+    # PHASE 2 — FDIA ATTACK INJECTION + DETECTION
     # ----------------------------------------------------------
-    print("\n[PHASE 1F] Phase 1 evaluation — natural fault detection...")
-    test_residuals = compute_residuals(model, test_images)
-    test_scores    = residuals_to_sequence_scores(test_residuals)
-    p1_results     = evaluate_detector(test_scores, test_labels, tau,
-                                       tag="Phase 1: Natural Faults")
+    print("\n[5] Phase 2 — FDIA attack injection and detection:")
+    healthy_test   = test_signals[test_labels == 0]
+    healthy_feats  = test_feats[test_labels == 0]
+    attack_labels  = np.ones(len(healthy_test), dtype=np.int32)
 
-    # Collect all results for final table
-    all_results = {"Natural Faults": p1_results}
-
-    # ----------------------------------------------------------
-    # PHASE 2: FDIA Attack Injection
-    # ----------------------------------------------------------
-    print("\n" + "="*60)
-    print("  PHASE 2 — FDIA ADVERSARIAL ATTACK INJECTION")
-    print("="*60)
-
-    # Use only healthy test signals as the attack substrate
-    # (we inject attacks INTO healthy signals to test evasion)
-    healthy_test_signals = test_signals[test_labels == 0]
-    print(f"[PHASE 2] Using {len(healthy_test_signals)} healthy test sequences as attack base")
-
-    # Labels for attacked sequences:
-    # Ground truth = 1 (anomalous), because an injected attack IS an anomaly
-    attack_labels = np.ones(len(healthy_test_signals), dtype=np.int32)
-
-    # For each attack type: inject → encode → compute residuals → evaluate
-    attacked_signals_dict = {}
-    residual_plot_dict    = {}
+    # Baseline healthy scores for combined evaluation
+    healthy_scores = detector.score(healthy_feats)
 
     for attack_type in ATTACK_TYPES:
-        print(f"\n[PHASE 2] Injecting attack: {attack_type} (ε={EPSILON})")
-
-        # Inject on raw (un-normalized) signals — attack happens at sensor level
-        attacked_raw = inject_attacks(
-            healthy_test_signals,
-            train_signals,
-            attack_type,
-            epsilon=EPSILON
+        # Inject attack
+        attacked_sigs  = inject_attacks(healthy_test, train_signals,
+                                        attack_type, EPSILON)
+        # Extract features from attacked signals
+        attacked_feats = extract_dataset_features(
+            attacked_sigs, f"  Features [{attack_type}]"
         )
-        attacked_signals_dict[attack_type] = attacked_raw
+        attacked_scores = detector.score(attacked_feats)
 
-        # Encode attacked signals
-        atk_images   = encode_dataset(attacked_raw, mu, std,
-                                      desc=f"  Encoding [{attack_type}]")
-
-        # Compute residuals
-        atk_residuals = compute_residuals(model, atk_images)
-        atk_scores    = residuals_to_sequence_scores(atk_residuals)
-
-        # For residual plots: combine healthy and attacked scores
-        # healthy scores = scores of clean healthy test seqs
-        healthy_test_images = encode_dataset(healthy_test_signals, mu, std,
-                                             desc="  Encoding [healthy base]")
-        healthy_res    = compute_residuals(model, healthy_test_images)
-        healthy_scores = residuals_to_sequence_scores(healthy_res)
-
-        combined_scores = np.concatenate([healthy_scores, atk_scores])
+        # Combined evaluation: healthy vs attacked
+        combined_scores = np.concatenate([healthy_scores, attacked_scores])
         combined_labels = np.concatenate([
-            np.zeros(len(healthy_scores)),
-            np.ones(len(atk_scores))
-        ])
-        residual_plot_dict[attack_type] = (combined_scores, combined_labels.astype(int))
+            np.zeros(len(healthy_scores)), attack_labels
+        ]).astype(int)
 
-        # Evaluate
-        atk_results = evaluate_detector(
-            combined_scores, combined_labels.astype(int), tau,
-            tag=f"Phase 2: {attack_type}"
+        tag = f"Phase 2: {attack_type}"
+        res = evaluate(combined_scores, combined_labels, tau, tag=tag)
+        all_results[tag]    = res
+        score_dist_data[attack_type] = res
+
+    # ----------------------------------------------------------
+    # PHASE 3 — GOODFELLOW ADVERSARIAL TRAINING
+    # ----------------------------------------------------------
+    print(f"\n[6] Phase 3 — Adversarial training (Goodfellow et al. 2015)")
+    print(f"    α={ADV_ALPHA}  ε={ADV_EPSILON}")
+
+    hardened = adversarial_train(train_signals, train_feats,
+                                 alpha=ADV_ALPHA, epsilon=ADV_EPSILON)
+    tau_h    = hardened.tau
+
+    # Re-evaluate on natural faults with hardened detector
+    test_scores_h = hardened.score(test_feats)
+    p3_natural    = evaluate(test_scores_h, test_labels, tau_h,
+                             tag="Phase 3: Natural Faults (hardened)")
+    all_results["Phase 3: Natural Faults (hardened)"] = p3_natural
+
+    # Re-evaluate all attack types with hardened detector
+    print("\n  Re-evaluating attacks with hardened detector:")
+    for attack_type in ATTACK_TYPES:
+        attacked_sigs  = inject_attacks(healthy_test, train_signals,
+                                        attack_type, EPSILON)
+        attacked_feats = extract_dataset_features(
+            attacked_sigs, f"  Features [{attack_type}]"
         )
-        all_results[f"Attack: {attack_type}"] = atk_results
+        attacked_scores_h = hardened.score(attacked_feats)
+        healthy_scores_h  = hardened.score(healthy_feats)
+
+        combined_scores = np.concatenate([healthy_scores_h, attacked_scores_h])
+        combined_labels = np.concatenate([
+            np.zeros(len(healthy_scores_h)), attack_labels
+        ]).astype(int)
+
+        tag = f"Phase 3: {attack_type} (hardened)"
+        res = evaluate(combined_scores, combined_labels, tau_h, tag=tag)
+        all_results[tag] = res
 
     # ----------------------------------------------------------
-    # PHASE 3: Plots & Results Table
+    # RESULTS + PLOTS
     # ----------------------------------------------------------
-    print("\n[PHASE 3] Generating paper-ready plots...")
-
+    print("\n[7] Generating paper-ready outputs...")
     plot_roc_curves(all_results)
-    plot_residual_distributions(residual_plot_dict, tau)
-
-    # Signal comparison plot (one example sequence)
-    example_attacked = {
-        atk: attacked_signals_dict[atk][0]
-        for atk in ATTACK_TYPES
-    }
-    plot_attacked_signal(healthy_test_signals[0], example_attacked, mu, std)
-
-    # Final results table
+    plot_score_distributions(score_dist_data, tau, tau_h)
     print_results_table(all_results)
 
-    # Save model
-    torch.save(model.state_dict(), "cae_fdia.pt")
-    print("\n[DONE] Model saved to cae_fdia.pt")
-    print("[DONE] All outputs saved. Ready for paper write-up.")
-
-    return model, all_results, tau
+    print("\n[DONE] Pipeline complete.")
+    return detector, hardened, all_results, tau, tau_h
 
 
 # ============================================================
 # ENTRY POINT
 # ============================================================
 if __name__ == "__main__":
-    model, results, tau = main()
+    detector, hardened, results, tau, tau_h = main()
